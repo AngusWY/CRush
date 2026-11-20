@@ -1,0 +1,7 @@
+- lang: c
+  method_list: ["main"]
+  exclude_paths:
+    - "_test.c"
+    - "/test/"
+    - "/tests/"
+    - "/examples/"

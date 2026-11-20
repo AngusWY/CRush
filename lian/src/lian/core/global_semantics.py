@@ -1,0 +1,577 @@
+
+
+import os,sys
+import pprint
+import copy
+from os.path import commonprefix
+
+import networkx as nx
+from lian.core.prelim_semantics import P2PrelimSemanticAnalysis
+from lian.util import util
+from lian.config import config
+import lian.util.data_model as dm
+from lian.config.constants import (
+    LIAN_INTERNAL,
+    STATE_TYPE_KIND,
+    SYMBOL_DEPENDENCY_GRAPH_EDGE_KIND,
+    SYMBOL_OR_STATE,
+    ANALYSIS_PHASE_ID,
+    CALL_OPERATION,
+    SENSITIVE_OPERATIONS
+)
+from lian.common_structs import (
+    MetaComputeFrame,
+    P2ResultFlag,
+    Symbol,
+    State,
+    ComputeFrame,
+    ComputeFrameStack,
+    SimpleWorkList,
+    SummaryData,
+    InterruptionData,
+    MethodSummaryTemplate,
+    SymbolDefNode,
+    SymbolStateSpace,
+    BasicCallGraph,
+    CallGraph,
+    PathManager,
+    StateDefNode,
+    MethodSummaryInstance,
+    CallPath,
+    StmtStatus,
+    StateFlowGraph,
+    CallSite,
+)
+from lian.basics.entry_points import EntryPointGenerator
+from lian.basics.control_flow import ControlFlowAnalysis
+from lian.basics.stmt_def_use_analysis import StmtDefUseAnalysis
+from lian.core.stmt_states import StmtStates
+from lian.core.prelim_semantics import P2PrelimSemanticAnalysis
+from lian.util.gir_block import GIRBlockViewer
+from lian.util.loader import Loader
+from lian.core.resolver import Resolver
+from lian.core.global_stmt_states import GlobalStmtStates
+from networkx.generators.classic import complete_graph
+
+
+class P3GlobalSemanticAnalysis(P2PrelimSemanticAnalysis):
+    def __init__(self, lian, analyzed_method_list):
+        super().__init__(lian)
+        self.max_analysis_round = config.MAX_ANALYSIS_ROUND_FOR_GLOBAL_ANALYSIS
+        self.path_manager = PathManager()
+        self.analyzed_method_list = analyzed_method_list
+        self.analysis_phase_id = ANALYSIS_PHASE_ID.GLOBAL_SEMANTICS
+        self.caller_unknown_callee_edge = {}
+        self.call_site_analyze_counter = {}
+        self.context_analyze_counter = {}
+
+    def _describe_method_context(self, method_id):
+        method_name = "<unknown>"
+        unit_path = "<unknown>"
+
+        try:
+            method_format = self.loader.convert_method_id_to_method_decl_format(method_id)
+            if method_format and getattr(method_format, "name", None):
+                method_name = method_format.name
+        except Exception:
+            pass
+
+        try:
+            unit_id = self.loader.convert_method_id_to_unit_id(method_id)
+            unit_info = self.loader.convert_module_id_to_module_info(unit_id)
+            if unit_info and getattr(unit_info, "original_path", None):
+                unit_path = unit_info.original_path
+        except Exception:
+            pass
+
+        return method_name, unit_path
+
+    def get_stmt_id_to_callee_info(self, callees):
+        results = {}
+        for each_callee in callees or ():
+            results[each_callee.stmt_id] = each_callee
+        return results
+
+    def adjust_index_of_status_space(
+        self, baseline_index, frame, status, space, defined_symbols,
+        symbol_bit_vector, state_bit_vector, method_summary_template,
+    ):
+        def shift_index(index):
+            return index if index == -1 else index + baseline_index
+
+        def shift_symbol_def(node):
+            return SymbolDefNode(
+                index=shift_index(node.index),
+                symbol_id=node.symbol_id,
+                stmt_id=node.stmt_id,
+            )
+
+        def shift_state_def(node):
+            return StateDefNode(
+                index=shift_index(node.index),
+                state_id=node.state_id,
+                stmt_id=node.stmt_id,
+            )
+
+        def shift_definition(node):
+            if isinstance(node, SymbolDefNode):
+                return shift_symbol_def(node)
+            if isinstance(node, StateDefNode):
+                return shift_state_def(node)
+            return node
+
+        def shift_definitions(nodes):
+            return {shift_definition(node) for node in nodes}
+
+        def shift_bit_vector(manager):
+            if manager is None:
+                return
+            manager.bit_pos_to_id = {
+                position: shift_definition(node)
+                for position, node in manager.bit_pos_to_id.items()
+            }
+            manager.id_to_bit_pos = {
+                node: position
+                for position, node in manager.bit_pos_to_id.items()
+            }
+
+        if method_summary_template:
+            for content_record in method_summary_template.get_important_symbol_records():
+                for symbol_id, indexes in content_record.items():
+                    content_record[symbol_id] = {
+                        shift_index(index) for index in indexes
+                    }
+            method_summary_template.external_symbol_to_state = {
+                symbol_id: shift_index(index)
+                for symbol_id, index
+                in method_summary_template.external_symbol_to_state.items()
+            }
+            method_summary_template.raw_to_new_index = {
+                shift_index(raw_index): compact_index
+                for raw_index, compact_index
+                in method_summary_template.raw_to_new_index.items()
+            }
+            method_summary_template.index_to_default_value = {
+                shift_index(raw_index): default_symbol_id
+                for raw_index, default_symbol_id
+                in method_summary_template.index_to_default_value.items()
+            }
+
+        shift_bit_vector(symbol_bit_vector)
+        shift_bit_vector(state_bit_vector)
+
+        if defined_symbols is not None:
+            for stmt_id, definitions in defined_symbols.items():
+                defined_symbols[stmt_id] = shift_definitions(definitions)
+        if hasattr(frame, "defined_states"):
+            frame.defined_states = {
+                state_id: shift_definitions(definitions)
+                for state_id, definitions in frame.defined_states.items()
+            }
+        if hasattr(frame, "all_symbol_defs"):
+            frame.all_symbol_defs = shift_definitions(frame.all_symbol_defs)
+        if hasattr(frame, "all_state_defs"):
+            frame.all_state_defs = shift_definitions(frame.all_state_defs)
+
+        for stmt_status in status.values():
+            stmt_status.defined_symbol = shift_index(stmt_status.defined_symbol)
+            stmt_status.used_symbols = [
+                shift_index(index) for index in stmt_status.used_symbols
+            ]
+            stmt_status.implicitly_used_symbols = [
+                shift_index(index) for index in stmt_status.implicitly_used_symbols
+            ]
+            stmt_status.implicitly_defined_symbols = [
+                shift_index(index)
+                for index in stmt_status.implicitly_defined_symbols
+            ]
+            stmt_status.defined_states = {
+                shift_index(index) for index in stmt_status.defined_states
+            }
+            stmt_status.in_symbol_bits = shift_definitions(
+                stmt_status.in_symbol_bits
+            )
+            stmt_status.out_symbol_bits = shift_definitions(
+                stmt_status.out_symbol_bits
+            )
+            stmt_status.in_state_bits = shift_definitions(
+                stmt_status.in_state_bits
+            )
+            stmt_status.out_state_bits = shift_definitions(
+                stmt_status.out_state_bits
+            )
+
+        for item in space:
+            if isinstance(item, Symbol):
+                item.states = {shift_index(index) for index in item.states}
+            elif isinstance(item, State):
+                item.fields = {
+                    name: {shift_index(index) for index in indexes}
+                    for name, indexes in item.fields.items()
+                }
+                item.array = [
+                    {shift_index(index) for index in indexes}
+                    for indexes in item.array
+                ]
+                item.tangping_elements = {
+                    shift_index(index) for index in item.tangping_elements
+                }
+
+    def init_compute_frame(self, frame: ComputeFrame, frame_stack: ComputeFrameStack, global_space):
+        if frame.is_meta_frame:
+            return None
+
+        frame.has_been_inited = True
+        frame.frame_stack = frame_stack
+        method_id = frame.method_id
+
+        if not self.loader.contain_symbol_state_space_p1(method_id):
+            return None
+        try:
+            frame.cfg = self.loader.get_method_cfg(method_id)
+        except Exception as e:
+            method_name, unit_path = self._describe_method_context(method_id)
+            raise RuntimeError(
+                f"Failed to load CFG for method_id={method_id}, "
+                f"method={method_name}, file={unit_path}"
+            ) from e
+        if util.is_empty(frame.cfg):
+            return None
+        if len(frame_stack) > 2:
+            last_frame = frame_stack[-2]
+            frame.call_path = last_frame.call_path.add_call(
+                last_frame.method_id, frame.call_stmt_id, frame.method_id
+            )
+            self.path_manager.add_path(frame.call_path)
+
+        if not self.options.enable_p2:
+            if super().init_compute_frame(
+                frame, frame_stack, copy_p1_state_space=True
+            ) is None:
+                return None
+
+            frame.stmt_id_to_status = {
+                stmt_id: stmt_status.copy()
+                for stmt_id, stmt_status in frame.stmt_id_to_status.items()
+            }
+            frame.method_def_use_summary = frame.method_def_use_summary.copy()
+            frame.all_local_symbol_ids = (
+                frame.method_def_use_summary.local_symbol_ids
+            )
+
+            for stmt in frame.stmt_worklist:
+                frame.stmts_with_symbol_update.add(stmt)
+
+            frame.stmt_state_analysis = GlobalStmtStates(
+                analysis_phase_id = self.analysis_phase_id,
+                event_manager = self.event_manager,
+                loader = self.loader,
+                resolver = self.resolver,
+                compute_frame = frame,
+                path_manager = self.path_manager,
+                caller_unknown_callee_edge = self.caller_unknown_callee_edge,
+                complete_graph=self.options.complete_graph,
+            )
+
+            self.adjust_index_of_status_space(
+                len(global_space),
+                frame,
+                frame.stmt_id_to_status,
+                frame.symbol_state_space,
+                frame.defined_symbols,
+                frame.symbol_bit_vector_manager,
+                frame.state_bit_vector_manager,
+                frame.method_summary_template,
+            )
+            for item in frame.symbol_state_space:
+                global_space.add(item)
+            frame.symbol_state_space = global_space
+
+            return frame
+
+
+
+        round_number = config.FIRST_ROUND
+        if method_id in self.analyzed_method_list:
+            round_number = config.SECOND_ROUND
+        _, parameter_decls, method_body = self.loader.get_splitted_method_gir(method_id)
+        frame.unit_gir = GIRBlockViewer.from_parts(parameter_decls, method_body)
+
+        for stmt_id in frame.unit_gir.get_all_stmt_ids():
+            frame.stmt_counters[stmt_id] = round_number
+            frame.is_first_round[stmt_id] = True
+
+        frame.stmt_state_analysis = GlobalStmtStates(
+            analysis_phase_id = self.analysis_phase_id,
+            event_manager = self.event_manager,
+            loader = self.loader,
+            resolver = self.resolver,
+            compute_frame = frame,
+            path_manager = self.path_manager,
+            caller_unknown_callee_edge = self.caller_unknown_callee_edge,
+            complete_graph=self.options.complete_graph,
+        )
+
+        frame.stmt_worklist = SimpleWorkList(graph = frame.cfg)
+        first_stmts = util.find_cfg_first_nodes(frame.cfg)
+        frame.stmt_worklist.add(first_stmts)
+        frame.stmts_with_symbol_update.add(first_stmts)
+        source_defined_symbols = self.loader.get_method_defined_symbols_p2(method_id)
+        defined_symbols = {
+            stmt_id: definitions.copy()
+            for stmt_id, definitions in (source_defined_symbols or {}).items()
+        }
+        if defined_symbols:
+            frame.defined_symbols = defined_symbols
+            all_symbol_defs = set()
+            for stmt_id in frame.defined_symbols:
+                symbol_def_set = frame.defined_symbols[stmt_id]
+                for symbol_def in symbol_def_set:
+                    all_symbol_defs.add(symbol_def)
+            frame.all_symbol_defs = all_symbol_defs
+
+        source_defined_states = self.loader.get_method_defined_states_p2(method_id)
+        defined_states = {
+            state_id: definitions.copy()
+            for state_id, definitions in (source_defined_states or {}).items()
+        }
+        if defined_states:
+            frame.defined_states = defined_states
+
+        source_status = self.loader.get_stmt_status_p2(method_id)
+        stmt_id_to_status = {
+            stmt_id: stmt_status.copy()
+            for stmt_id, stmt_status in (source_status or {}).items()
+        }
+        source_symbol_state_space = self.loader.get_symbol_state_space_p2(method_id)
+        symbol_state_space = (
+            source_symbol_state_space.copy()
+            if source_symbol_state_space else SymbolStateSpace()
+        )
+        source_symbol_bit_vector = self.loader.get_symbol_bit_vector_p2(method_id)
+        symbol_bit_vector_manager = (
+            source_symbol_bit_vector.copy() if source_symbol_bit_vector else None
+        )
+        source_state_bit_vector = self.loader.get_state_bit_vector_p2(method_id)
+        state_bit_vector_manager = (
+            source_state_bit_vector.copy() if source_state_bit_vector else None
+        )
+        frame.symbol_bit_vector_manager = symbol_bit_vector_manager
+        frame.state_bit_vector_manager = state_bit_vector_manager
+        source_method_summary = self.loader.get_method_summary_template(method_id)
+        method_summary_template = (
+            source_method_summary.copy() if source_method_summary else None
+        )
+        frame.method_summary_template = method_summary_template
+        self.adjust_index_of_status_space(len(global_space), frame, stmt_id_to_status, symbol_state_space, defined_symbols, symbol_bit_vector_manager, state_bit_vector_manager, method_summary_template)
+        frame.stmt_id_to_status = stmt_id_to_status
+        frame.defined_symbols = defined_symbols
+
+        if not symbol_state_space:
+            return None
+        for item in symbol_state_space:
+            global_space.add(item)
+
+        frame.symbol_state_space = global_space
+        frame.stmt_id_to_callee_info = self.get_stmt_id_to_callee_info(self.loader.get_method_internal_callees(method_id))
+
+        source_method_def_use = self.loader.get_method_def_use_summary(method_id)
+        frame.method_def_use_summary = (
+            source_method_def_use.copy() if source_method_def_use else None
+        )
+        frame.all_local_symbol_ids = (
+            frame.method_def_use_summary.local_symbol_ids
+            if frame.method_def_use_summary else set()
+        )
+        frame.external_symbol_id_to_initial_state_index = frame.method_summary_template.external_symbol_to_state
+        frame.space_summary = self.loader.get_symbol_state_space_summary_p2(method_id)
+        frame.symbol_graph.graph = self.loader.get_method_symbol_graph_p2(method_id)
+        frame.method_summary_instance.copy_template_to_instance(frame.method_summary_template)
+        return frame
+
+    def collect_external_symbol_states(self, frame: ComputeFrame, stmt_id, stmt, symbol_id, summary: MethodSummaryTemplate, old_key_state_indexes: set):
+
+        if not frame.is_first_round[stmt_id]:
+            return old_key_state_indexes
+
+        new_state_indexes = set()
+
+        status = frame.stmt_id_to_status[stmt_id]
+        old_length = len(frame.symbol_state_space)
+        for old_key_state_index in old_key_state_indexes:
+            old_key_state = frame.symbol_state_space[old_key_state_index]
+            if not(old_key_state and isinstance(old_key_state, State)):
+                continue
+
+            if old_key_state.data_type in (LIAN_INTERNAL.METHOD_DECL, LIAN_INTERNAL.CLASS_DECL):
+                new_state_indexes.add(old_key_state_index)
+                continue
+
+            if old_key_state.symbol_or_state != SYMBOL_OR_STATE.EXTERNAL_KEY_STATE:
+                continue
+
+
+            if stmt.operation in CALL_OPERATION and old_key_state.data_type == LIAN_INTERNAL.THIS:
+                continue
+
+            if old_key_state.state_type != STATE_TYPE_KIND.ANYTHING:
+                continue
+
+            resolved_state_indexes = self.resolver.resolve_symbol_states(old_key_state, frame.frame_stack, frame, stmt_id, stmt, status)
+            util.add_to_dict_with_default_set(frame.method_summary_instance.resolver_result, old_key_state_index, resolved_state_indexes)
+            for each_resolved_state_index in resolved_state_indexes:
+                each_resolved_state: State = frame.symbol_state_space[each_resolved_state_index]
+                each_resolved_state.state_id = old_key_state.state_id
+            new_state_indexes.update(resolved_state_indexes)
+
+
+        new_length = len(frame.symbol_state_space)
+        while old_length < new_length:
+            item = frame.symbol_state_space[old_length]
+            if isinstance(item, State):
+                status.defined_states.add(old_length)
+            old_length += 1
+
+
+
+
+
+        return new_state_indexes
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    def analyze_frame_stack(self, frame_stack: ComputeFrameStack, global_space, sfg: StateFlowGraph):
+        while len(frame_stack) >= 2:
+
+            frame: ComputeFrame = frame_stack.peek()
+            if frame.is_meta_frame:
+                frame_stack.pop()
+                continue
+
+            if not frame.has_been_inited:
+
+                if self.init_compute_frame(frame, frame_stack, global_space) is None:
+
+                    frame_stack.pop()
+                    continue
+
+            if frame.content_already_analyzed:
+
+                children_done_flag = True
+                for key, value in frame.content_already_analyzed.items():
+                    if not value:
+                        frame.content_already_analyzed[key] = True
+                        new_frame = ComputeFrame(
+                            method_id = key.callee_id,
+                            caller_id = key.caller_id,
+                            call_stmt_id = key.call_stmt_id,
+                            loader = self.loader,
+                            space = global_space,
+                            params_list = frame.args_list,
+                            classes_of_method = frame.callee_classes_of_method,
+                            this_class_ids = frame.callee_this_class_ids,
+                            state_flow_graph = sfg,
+                            call_site_analyze_counter=self.call_site_analyze_counter,
+                            context_analyze_counter=self.context_analyze_counter,
+                        )
+                        frame_stack.add(new_frame)
+                        children_done_flag = False
+                        break
+                if not children_done_flag:
+                    if self.options.debug:
+                        util.debug(f"\t<method {frame.method_id}> has content to be analyzed: {frame.content_already_analyzed}")
+                    continue
+
+            if not self.options.quiet:
+                print(f"Analyzing <method {frame.method_id} name: {frame.method_name}>")
+
+            result: P2ResultFlag = self.analyze_stmts(frame)
+            if util.is_available(result) and result.interruption_flag:
+                frame.interruption_flag = True
+                data: InterruptionData = result.interruption_data
+                new_callee = False
+                frame.args_list = data.args_list
+                frame.callee_classes_of_method = data.classes_of_method
+                frame.callee_this_class_ids = data.this_class_ids
+                frame.content_already_analyzed = {}
+                for callee_id in data.callee_ids:
+                    key = CallSite(data.caller_id, data.call_stmt_id, callee_id)
+                    if key not in frame.content_already_analyzed:
+                        frame.content_already_analyzed[key] = False
+                        new_callee = True
+
+                if new_callee:
+                    continue
+
+            context_id = frame.hash_context()
+
+
+            summary = self.generate_and_save_analysis_summary(frame, frame.method_summary_instance)
+
+            self.loader.save_method_summary_instance(context_id, summary)
+            self.loader.save_stmt_status_p3(context_id, frame.stmt_id_to_status)
+            self.loader.save_method_defined_symbols_p3(context_id, frame.defined_symbols)
+
+
+
+
+            frame_stack.pop()
+            if not self.options.quiet:
+                print(f"<method {frame.method_id}> is Done")
+
+
+
+
+    def init_frame_stack(self, entry_method_id, global_space, sfg):
+        frame_stack = ComputeFrameStack()
+        frame_stack.add(MetaComputeFrame())
+        entry_frame = ComputeFrame(
+            method_id = entry_method_id,
+            loader = self.loader,
+            space = global_space,
+            state_flow_graph = sfg,
+            call_site_analyze_counter=self.call_site_analyze_counter,
+            context_analyze_counter=self.context_analyze_counter
+        )
+        frame_stack.add(entry_frame)
+        return frame_stack
+
+    def run(self):
+        if not self.options.quiet:
+            print("\n########### # Phase III: Global (Top-down) Semantic Analysis ##########")
+
+        if not self.options.enable_p2:
+            self.max_analysis_round = config.MAX_ANALYSIS_ROUND_FOR_PRELIM_ANALYSIS
+
+        entry_points = self.loader.get_entry_points()
+        entry_count = len(entry_points)
+        for entry_index, entry_point in enumerate(entry_points, start=1):
+            if not self.options.quiet:
+                print(f"[P3] entry {entry_index}/{entry_count} started: {entry_point}")
+            global_space = SymbolStateSpace()
+            self.call_site_analyze_counter = {}
+            self.context_analyze_counter = {}
+            sfg = StateFlowGraph(entry_point)
+            frame_stack = self.init_frame_stack(entry_point, global_space, sfg)
+            self.analyze_frame_stack(frame_stack, global_space, sfg)
+            self.loader.save_global_sfg_by_entry_point(entry_point, sfg)
+            self.save_graph_to_dot(sfg.graph, entry_point, self.analysis_phase_id, global_space)
+            self.loader.save_symbol_state_space_p3(entry_point, global_space)
+            if not self.options.quiet:
+                print(f"[P3] entry {entry_index}/{entry_count} completed: {entry_point}")
+
+        self.loader.save_call_paths_p3(self.path_manager.paths)

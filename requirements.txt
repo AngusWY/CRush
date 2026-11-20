@@ -1,0 +1,12 @@
+setuptools
+line_profiler
+tree-sitter==0.25.2
+tree-sitter-c
+pandas
+pyarrow
+networkx
+numpy
+matplotlib
+PyYAML
+streamlit
+openai>=1.0.0
